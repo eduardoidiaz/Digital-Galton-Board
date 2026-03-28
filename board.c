@@ -65,49 +65,48 @@ typedef signed int fix15 ;
 #define GALTON_BOARD_START_Y 250
 #define GALTON_BOARD_ROWS 10
 
+// Ball properties
+struct Ball {
+    fix15 x;
+    fix15 y;
+    fix15 vx;
+    fix15 vy;
+};
+
 // the color of the boid
 char color = WHITE ;
 
 // Ball on core 0
-fix15 ball0_x ;
-fix15 ball0_y ;
-fix15 ball0_vx ;
-fix15 ball0_vy ;
+struct Ball ball0;
 
 // Create a ball dropping it from the center of screen
-void spawn_ball(fix15* x, fix15* y, fix15* vx, fix15* vy, int direction)
-{
-  // Start in center of screen
-  *x = int2fix15(320) ;
-  *y = int2fix15(240) ;
-  // Choose left or right
-//   if (direction) *vx = int2fix15(3) ;
-//   else *vx = int2fix15(-3) ;
-  // Moving down
-  *vy = int2fix15(1) ;
+void spawn_ball(struct Ball *b) {
+    b->x = int2fix15(320);
+    b->y = int2fix15(240);
+    b->vy = int2fix15(1);
 }
 
 // Draw the boundaries
 void drawArena() {
-  drawVLine(100, 100, 280, WHITE) ;
-  drawVLine(540, 100, 280, WHITE) ;
-  drawHLine(100, 100, 440, WHITE) ;
-  drawHLine(100, 380, 440, WHITE) ;
+    drawVLine(100, 100, 280, WHITE) ;
+    drawVLine(540, 100, 280, WHITE) ;
+    drawHLine(100, 100, 440, WHITE) ;
+    drawHLine(100, 380, 440, WHITE) ;
 }
 
 // Detect bottoming out
-void bottoming_out(fix15* x, fix15* y, fix15* vx, fix15* vy) {
+void bottoming_out(struct Ball *b) {
     // If the ball bottoms out 'respawn'
-    if (hitBottom(*y)) {
-        // Start in center of screen
-        *x = int2fix15(320) ;
-        *y = int2fix15(240) ;
+    if (hitBottom(b->y)) {
+        // Start in the center of screen
+        b->x = int2fix15(320);
+        b->y = int2fix15(240);
         // Moving down
-        *vy = int2fix15(1) ;
+        b->vy = int2fix15(1);
     }
     // Update position using velocity
-    *x = *x + *vx ;
-    *y = *y + *vy ;
+    b->x = b->x + b->vx;
+    b->y = b->y + b->vy;
 }
 
 // ==================================================
@@ -124,7 +123,7 @@ static PT_THREAD (protothread_serial(struct pt *pt))
     sprintf(pt_serial_out_buffer, "Protothreads RP2040 v1.0\n\r");
     // non-blocking write
     serial_write ;
-      while(1) {
+    while(1) {
         // print prompt
         sprintf(pt_serial_out_buffer, "input a number in the range 1-15: ");
         // non-blocking write
@@ -135,10 +134,10 @@ static PT_THREAD (protothread_serial(struct pt *pt))
         sscanf(pt_serial_in_buffer,"%d", &user_input) ;
         // update boid color
         if ((user_input > 0) && (user_input < 16)) {
-          color = (char)user_input ;
+            color = (char)user_input ;
         }
-      } // END WHILE(1)
-  PT_END(pt);
+    } // END WHILE(1)
+    PT_END(pt);
 } // timer thread
 
 // Animation on core 0
@@ -152,26 +151,27 @@ static PT_THREAD (protothread_anim(struct pt *pt))
     static int spare_time ;
 
     // Spawn a ball
-    spawn_ball(&ball0_x, &ball0_y, &ball0_vx, &ball0_vy, 0);
+    //spawn_ball(&ball0_x, &ball0_y, &ball0_vx, &ball0_vy, 0);
+    spawn_ball(&ball0);
 
     while(1) {
-      // Measure time at start of thread
-      begin_time = time_us_32() ;      
-      // erase ball
-      drawRect(fix2int15(ball0_x), fix2int15(ball0_y), 2, 2, BLACK);
-      // detect ball bottoming out
-      bottoming_out(&ball0_x, &ball0_y, &ball0_vx, &ball0_vy);
-      // draw the ball at its new position
-      drawRect(fix2int15(ball0_x), fix2int15(ball0_y), 2, 2, color); 
-      // draw the boundaries
-      drawArena() ;
-      // delay in accordance with frame rate
-      spare_time = FRAME_RATE - (time_us_32() - begin_time) ;
-      // yield for necessary amount of time
-      PT_YIELD_usec(spare_time) ;
-     // NEVER exit while
+        // Measure time at start of thread
+        begin_time = time_us_32() ;      
+        // erase ball
+        drawRect(fix2int15(ball0.x), fix2int15(ball0.y), 2, 2, BLACK);
+        // detect ball bottoming out
+        bottoming_out(&ball0);
+        // draw the ball at its new position
+        drawRect(fix2int15(ball0.x), fix2int15(ball0.y), 2, 2, color); 
+        // draw the boundaries
+        drawArena() ;
+        // delay in accordance with frame rate
+        spare_time = FRAME_RATE - (time_us_32() - begin_time) ;
+        // yield for necessary amount of time
+        PT_YIELD_usec(spare_time) ;
+        // NEVER exit while
     } // END WHILE(1)
-  PT_END(pt);
+    PT_END(pt);
 } // animation thread
 
 
@@ -186,26 +186,26 @@ static PT_THREAD (protothread_anim1(struct pt *pt))
     static int spare_time ;
 
     while(1) {
-      // Measure time at start of thread
-      begin_time = time_us_32() ;      
+        // Measure time at start of thread
+        begin_time = time_us_32() ;      
 
-      // delay in accordance with frame rate
-      spare_time = FRAME_RATE - (time_us_32() - begin_time) ;
-      // yield for necessary amount of time
-      PT_YIELD_usec(spare_time) ;
-     // NEVER exit while
+        // delay in accordance with frame rate
+        spare_time = FRAME_RATE - (time_us_32() - begin_time) ;
+        // yield for necessary amount of time
+        PT_YIELD_usec(spare_time) ;
+        // NEVER exit while
     } // END WHILE(1)
-  PT_END(pt);
+    PT_END(pt);
 } // animation thread
 
 // ========================================
 // === core 1 main -- started in main below
 // ========================================
 void core1_main(){
-  // Add animation thread
-  pt_add_thread(protothread_anim1);
-  // Start the scheduler
-  pt_schedule_start ;
+    // Add animation thread
+    pt_add_thread(protothread_anim1);
+    // Start the scheduler
+    pt_schedule_start ;
 
 }
 
@@ -214,41 +214,40 @@ void core1_main(){
 // ========================================
 // USE ONLY C-sdk library
 int main(){
-  set_sys_clock_khz(150000, true) ;
-  // initialize stio
-  stdio_init_all() ;
+    set_sys_clock_khz(150000, true) ;
+    // initialize stio
+    stdio_init_all() ;
 
-  // initialize VGA
-  initVGA() ;
+    // initialize VGA
+    initVGA() ;
 
-  // Starting Center of Screen
-//   int NUM_ROWS = GALTON_BOARD_ROWS;
-  int x_coord = GALTON_BOARD_START_X;
-  int y_coord = GALTON_BOARD_START_Y;
-  int x_coord_inc = 14;
-  int y_coord_inc = 14;
-  int x_start_adj = x_coord_inc/2;
+    // Starting Center of Screen
+    int x_coord = GALTON_BOARD_START_X;
+    int y_coord = GALTON_BOARD_START_Y;
+    int x_coord_inc = 14;
+    int y_coord_inc = 14;
+    int x_start_adj = x_coord_inc/2;
 
-  for (int row=0; row<GALTON_BOARD_ROWS; row++) { // Rows in Galton Board
-    x_coord = 320 - x_start_adj*row; // Move starting location of pegs (no movement initially)
-    for (int peg=0; peg<row+1; peg++) { // Pegs per row in Galton Board (1 more than row number)
-        drawCircle(x_coord, y_coord, 3, WHITE);
-        fillCircle(x_coord, y_coord, 3, WHITE);
-        if (row > 0) {
-            x_coord += x_coord_inc; // increment x-coordinate to separate pegs horizontally
+    for (int row=0; row<GALTON_BOARD_ROWS; row++) { // Rows in Galton Board
+        x_coord = 320 - x_start_adj*row; // Move starting location of pegs (no movement initially)
+        for (int peg=0; peg<row+1; peg++) { // Pegs per row in Galton Board (1 more than row number)
+            drawCircle(x_coord, y_coord, 3, WHITE);
+            fillCircle(x_coord, y_coord, 3, WHITE);
+            if (row > 0) {
+                x_coord += x_coord_inc; // increment x-coordinate to separate pegs horizontally
+            }
         }
+        y_coord += y_coord_inc; // move next drawing location vertically
     }
-    y_coord += y_coord_inc; // move next drawing location vertically
-  }
 
-  // start core 1 
-  multicore_reset_core1();
-  multicore_launch_core1(&core1_main);
+    // start core 1 
+    multicore_reset_core1();
+    multicore_launch_core1(&core1_main);
 
-  // add threads
-  pt_add_thread(protothread_serial);
-  pt_add_thread(protothread_anim);
+    // add threads
+    pt_add_thread(protothread_serial);
+    pt_add_thread(protothread_anim);
 
-  // start scheduler
-  pt_schedule_start ;
+    // start scheduler
+    pt_schedule_start ;
 } 
