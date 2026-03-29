@@ -14,6 +14,10 @@ add_executable(Digital_Galton_Board)
 
 add_compile_options(-Ofast)
 
+# enable usb output
+pico_enable_stdio_usb(Digital_Galton_Board 1)
+# pico_enable_stdio_uart(VGA_Animation_Demo 0)
+
 # must match with pio filename and executable name from above
 pico_generate_pio_header(Digital_Galton_Board ${CMAKE_CURRENT_LIST_DIR}/hsync.pio)
 pico_generate_pio_header(Digital_Galton_Board ${CMAKE_CURRENT_LIST_DIR}/vsync.pio)
