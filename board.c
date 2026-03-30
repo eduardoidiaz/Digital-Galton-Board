@@ -64,11 +64,15 @@ typedef signed int fix15 ;
 #define GALTON_BOARD_START_X 320
 #define GALTON_BOARD_START_Y 250
 #define GALTON_BOARD_ROWS 10
-
 #define PEG_RADIUS 3
-
-#define NUM_BALLS 1
+#define NUM_BALLS 30
 #define NUM_PEGS (GALTON_BOARD_ROWS*(GALTON_BOARD_ROWS + 1))/2
+
+// Ball Parameters
+#define BALL_RADIUS 1
+#define BALL_START_X 320
+#define BALL_START_Y 240
+#define BALL_START_VY 0
 
 // Ball properties
 struct Ball {
@@ -104,16 +108,25 @@ volatile fix15 normal_y = 0;
 volatile fix15 intermediate = 0;
 volatile struct Peg *last_peg;
 
-double min = -2.0;
-double max = 2.0;
+double min = -1.0;
+double max = 1.0;
+
+volatile int m_left = 0;
+volatile int b_lft = 0;
+volatile int m_right = 0;
+volatile int b_rght = 0;
+
+volatile int collisions = 0;
+
+volatile int bottom = 0;
 
 // Create a ball dropping it from the center of screen
 void spawn_ball(struct Ball *b) {
-    b->x = int2fix15(320);
-    b->y = int2fix15(248);
-    b->vx = int2fix15((rand() % 5) + 1);
-    b->vy = int2fix15(0);
-    b->r = int2fix15(1);
+    b->x = int2fix15(BALL_START_X);
+    b->y = int2fix15(BALL_START_Y);
+    b->vx = float2fix15(min + ((double)rand() / RAND_MAX) * (max - min));
+    b->vy = int2fix15(BALL_START_VY);
+    b->r = int2fix15(BALL_RADIUS);
 }
 
 // Draw the boundaries
@@ -127,18 +140,17 @@ void drawArena() {
 // Detect bottoming out
 void bottoming_out(struct Ball *b) {
     // If the ball bottoms out 'respawn'
-    if (hitBottom(b->y)) {
+    if (b->y > int2fix15(bottom)) {
         // Start in the center of screen
-        b->x = int2fix15(320);
-        b->y = int2fix15(240);
-        b->vx = int2fix15((rand() % 2) + 1);
+        b->x = int2fix15(BALL_START_X);
+        b->y = int2fix15(BALL_START_Y);
         b->vx = float2fix15(min + ((double)rand() / RAND_MAX) * (max - min));
         // Moving down
-        b->vy = int2fix15(0);
+        b->vy = int2fix15(BALL_START_VY);
     }
     // Update position using velocity
-    b->x = b->x + b->vx;
-    b->y = b->y + b->vy;
+    // b->x = b->x + b->vx;
+    // b->y = b->y + b->vy;
 }
 
 // ==================================================
@@ -182,81 +194,97 @@ static PT_THREAD (protothread_anim(struct pt *pt))
     static int begin_time ;
     static int spare_time ;
 
-    // Spawn a ball
-    // spawn_ball(&ball0);
-    for (int i=0; i<NUM_BALLS; i++) {
-        spawn_ball(&ball_array[i]);
-    }
-
     while(1) {
         // Measure time at start of thread
         begin_time = time_us_32() ;      
 
-        // erase ball
-        // for (int i=0; i<NUM_BALLS; i++) {
-        //     // drawRect(fix2int15(ball_array[i].x), fix2int15(ball_array[i].y), 2, 2, BLACK);
-        //     drawCircle(fix2int15(ball_array[i].x), fix2int15(ball_array[i].y), fix2int15(ball_array[i].r), BLACK);
-        //     fillCircle(fix2int15(ball_array[i].x), fix2int15(ball_array[i].y), fix2int15(ball_array[i].r), BLACK);
-        // }
-
         for (int b=0; b<NUM_BALLS; b++) {
+            // Erase Ball
             drawCircle(fix2int15(ball_array[b].x), fix2int15(ball_array[b].y), fix2int15(ball_array[b].r), BLACK);
             fillCircle(fix2int15(ball_array[b].x), fix2int15(ball_array[b].y), fix2int15(ball_array[b].r), BLACK);
             for (int p=0; p<NUM_PEGS; p++) {
-                dx = ball_array[b].x - peg_array[p].x;
-                dy = ball_array[b].y - peg_array[p].y;
-                // Are both the x and y distances less than the collision distance?
-                if ((absfix15(dx) < (ball_array[b].r + peg_array[p].r)) && (absfix15(dy) < (ball_array[b].r + peg_array[p].r))) {
-                    // If so, compute the distance separating the ball and peg
-                    distance = sqrt(dx*dx + dy*dy);
-                    
-                    // Generate the normal vector that points from peg to ball
-                    normal_x = divfix(dx, float2fix15(distance));
-                    normal_y = divfix(dy, float2fix15(distance));
+                float dx = fix2float15(ball_array[b].x) - fix2float15(peg_array[p].x);
+                float dy = fix2float15(ball_array[b].y) - fix2float15(peg_array[p].y);
 
-                    // Collision Physics 
-                    intermediate = multfix15(int2fix15(-2), (multfix15(normal_x, ball_array[b].vx) + multfix15(normal_y, ball_array[b].vy)));
+                float radius_sum = fix2float15(ball_array[b].r) + fix2float15(peg_array[p].r);
 
-                    // Are ball velocity and normal vectors in opposite directions?
-                    if (intermediate > 0) {
-                        // Teleport it outside the collision distance with the peg
-                        ball_array[b].x = peg_array[p].x + multfix15(normal_x, float2fix15(distance + 1));
-                        ball_array[b].y = peg_array[p].y + multfix15(normal_y, float2fix15(distance + 1));
+                // Fast AABB-style early reject
+                if (fabsf(dx) > radius_sum || fabsf(dy) > radius_sum) {
+                    continue;
+                }
 
-                        // Update its velocity
-                        ball_array[b].vx = ball_array[b].vx + multfix15(normal_x, intermediate);
-                        ball_array[b].vy = ball_array[b].vy + multfix15(normal_y, intermediate);
+                float dist_sq = dx * dx + dy * dy;
+                float radius_sq = radius_sum * radius_sum;
 
-                        // Did we just strike a new peg?
+                // Check actual collision
+                if (dist_sq < radius_sq) {
+
+                    // Avoid divide-by-zero
+                    if (dist_sq < 1e-6f) {
+                        continue;
+                    }
+
+                    // Dot product (velocity toward peg?)
+                    float dot = dx * fix2float15(ball_array[b].vx) + dy * fix2float15(ball_array[b].vy);
+
+                    // Only reflect if moving toward peg
+                    if (dot < 0.0f) {
+
+                        // Reflection factor (no sqrt needed)
+                        float factor = -2.0f * dot / dist_sq;
+
+                        // Reflect velocity
+                        ball_array[b].vx += float2fix15(dx * factor);
+                        ball_array[b].vy += float2fix15(dy * factor);
+
+                        // Push ball out of peg (minimal correction)
+                        float dist = sqrtf(dist_sq);
+                        float overlap = radius_sum - dist;
+
+                        float nx = dx / dist;
+                        float ny = dy / dist;
+
+                        ball_array[b].x += float2fix15(nx * overlap);
+                        ball_array[b].y += float2fix15(ny * overlap);
+
+                        // Trigger sound once per new peg
+                        // if (ball->last_peg_id != peg->id) {
+                        //     dma_trigger();
+                        //     ball->last_peg_id = peg->id;
+
+                        //     // Apply energy loss
+                        //     ball->vx *= bounciness;
+                        //     ball->vy *= bounciness;
+                        // }
                         if (&peg_array[p] != last_peg) {
                             // Make a sound
 
                             // Remove some energy from the ball
-                            ball_array[b].vx = 1.3 * ball_array[b].vx;
-                            ball_array[b].vy = 1.3 * ball_array[b].vy;
+                            ball_array[b].vx = 0.25 * ball_array[b].vx;
+                            ball_array[b].vy = 0.25 * ball_array[b].vy;
                         } 
+                        last_peg = &peg_array[p];
                     }
-                }
-                last_peg = &peg_array[p];
+                }   
             }
             // Respawn any balls that fall thru bottom
             bottoming_out(&ball_array[b]);
 
             // Bounce any balls the hit top/sides
             // TODO...
-            if (fix2int15(ball_array[b].y) + 2*fix2int15(ball_array[b].x) < 870) {
+
+            if (fix2int15(ball_array[b].y) - m_left*fix2int15(ball_array[b].x) < b_lft) {
                 ball_array[b].vx = -ball_array[b].vx;
+                // ball_array[b].vy = -ball_array[b].vy;
             }
-            if (fix2int15(ball_array[b].y) - 2*fix2int15(ball_array[b].x) < -410) {
+            if (fix2int15(ball_array[b].y) - m_right*fix2int15(ball_array[b].x) < b_rght) {
                 ball_array[b].vx = -ball_array[b].vx;
+                // ball_array[b].vy = -ball_array[b].vy;
             }
 
             // Apply gravity
             // ball_array[b].vy = ball_array[b].vy + int2fix15(1);
             ball_array[b].vy = ball_array[b].vy + float2fix15(0.15);
-
-            // drawCircle(fix2int15(ball_array[b].x), fix2int15(ball_array[b].y), fix2int15(ball_array[b].r), BLACK);
-            // fillCircle(fix2int15(ball_array[b].x), fix2int15(ball_array[b].y), fix2int15(ball_array[b].r), BLACK);
 
             // Use ball's updated velocity to update its position
             ball_array[b].x = ball_array[b].x + ball_array[b].vx;
@@ -265,23 +293,6 @@ static PT_THREAD (protothread_anim(struct pt *pt))
             drawCircle(fix2int15(ball_array[b].x), fix2int15(ball_array[b].y), fix2int15(ball_array[b].r), color);
             fillCircle(fix2int15(ball_array[b].x), fix2int15(ball_array[b].y), fix2int15(ball_array[b].r), color);
         }
-        // erase ball
-        // for (int i=0; i<NUM_BALLS; i++) {
-        //     // drawRect(fix2int15(ball_array[i].x), fix2int15(ball_array[i].y), 2, 2, BLACK);
-        //     drawCircle(fix2int15(ball_array[i].x), fix2int15(ball_array[i].y), fix2int15(ball_array[i].r), BLACK);
-        //     fillCircle(fix2int15(ball_array[i].x), fix2int15(ball_array[i].y), fix2int15(ball_array[i].r), BLACK);
-        // }
-        // detect ball bottoming out
-        // bottoming_out(&ball0);
-        // for (int i=0; i<NUM_BALLS; i++) {
-        //     bottoming_out(&ball_array[i]);
-        // }
-        // draw the ball at its new position
-        // for (int i=0; i<NUM_BALLS; i++) {
-        //     // drawRect(fix2int15(ball_array[i].x), fix2int15(ball_array[i].y), 2, 2, color);
-        //     drawCircle(fix2int15(ball_array[i].x), fix2int15(ball_array[i].y), fix2int15(ball_array[i].r), color);
-        //     fillCircle(fix2int15(ball_array[i].x), fix2int15(ball_array[i].y), fix2int15(ball_array[i].r), color);
-        // }
         // draw the boundaries
         drawArena() ;
         // delay in accordance with frame rate
@@ -307,6 +318,25 @@ static PT_THREAD (protothread_anim1(struct pt *pt))
     while(1) {
         // Measure time at start of thread
         begin_time = time_us_32() ;      
+
+        // Redraw PEGS
+        for (int i=0; i<NUM_PEGS; i++) {
+            drawCircle(fix2int15(peg_array[i].x), fix2int15(peg_array[i].y) , PEG_RADIUS, WHITE);
+        }
+
+        // printf("collisions = %d\n", collisions);
+
+        // printf("ball_array[0].x: %f\n", fix2float15(ball_array[0].x));
+        // printf("ball_array[0].y: %f\n", fix2float15(ball_array[0].y));
+        // printf("ball_array[0].vx: %f\n", fix2float15(ball_array[0].vx));
+        // printf("ball_array[0].vy: %f\n", fix2float15(ball_array[0].vy));
+        // printf("ball_array[0].r: %f\n", fix2float15(ball_array[0].r));
+        // printf("dx: %f\n", fix2float15(dx));
+        // printf("dy: %f\n", fix2float15(dy));
+
+
+
+
 
         // delay in accordance with frame rate
         spare_time = FRAME_RATE - (time_us_32() - begin_time) ;
@@ -358,28 +388,23 @@ int main(){
         x_coord = 320 - x_start_adj*row; // Move starting location of pegs (no movement initially)
         for (int peg=0; peg<row+1; peg++) { // Pegs per row in Galton Board (1 more than row number)
             drawCircle(x_coord, y_coord, PEG_RADIUS, WHITE);
-            fillCircle(x_coord, y_coord, PEG_RADIUS, WHITE);
-            // if (peg == 0) {
-            //     drawPixel(x_coord - 10, y_coord, WHITE);
-            // }
-            // if (peg == row) {
-            //     drawPixel(x_coord + 10, y_coord, WHITE);
-            // }
+            // fillCircle(x_coord, y_coord, PEG_RADIUS, WHITE);
+
             if (row == 0 && peg == 0) {
                 top_peg_x = x_coord;
                 top_peg_y = y_coord;
             }
-            if (row == 9 && peg == 0) {
+            if (row == GALTON_BOARD_ROWS-1 && peg == 0) {
                 bottom_left_peg_x = x_coord;
                 bottom_left_peg_y = y_coord;
             }
-            if (row == 9 && peg == row) {
+            if (row == GALTON_BOARD_ROWS-1 && peg == row) {
                 bottom_right_peg_x = x_coord;
                 bottom_right_peg_y = y_coord;
             }
-            peg_array[peg_idx].x = x_coord;
-            peg_array[peg_idx].y = y_coord;
-            peg_array[peg_idx].r = PEG_RADIUS;
+            peg_array[peg_idx].x = int2fix15(x_coord);
+            peg_array[peg_idx].y = int2fix15(y_coord);
+            peg_array[peg_idx].r = int2fix15(PEG_RADIUS);
             peg_idx += 1;
             if (row > 0) {
                 x_coord += x_coord_inc; // increment x-coordinate to separate pegs horizontally
@@ -402,11 +427,16 @@ int main(){
     int bottom_right_y = bottom_right_peg_y;
     // m = (y2 - y1)/(x2 - x1)
     int slope_left = (top_y - bottom_left_y)/(top_x - bottom_left_x);
+    m_left = slope_left;
     int slope_right = (top_y - bottom_right_y)/(top_x - bottom_right_x);
+    m_right = slope_right;
     // y = mx + b -> b = y - mx
     int b_left = top_y - slope_left*top_x;
+    b_lft = b_left;
     int b_right = top_y - slope_right*top_x;
+    b_rght = b_right;
 
+    bottom = bottom_left_peg_y;
 
     // Draw Left Diagonal of Galton Board (starting from bottom left)
     for (int y = bottom_left_y; y >= top_y; y--) {
@@ -432,6 +462,12 @@ int main(){
             }
         }
     }
+
+    for (int i=0; i<NUM_BALLS; i++) {
+        spawn_ball(&ball_array[i]);
+    }
+
+    sleep_ms(3000);
 
     // start core 1 
     multicore_reset_core1();
