@@ -548,6 +548,14 @@ inline void setCursor(short x, short y) {
   cursor_y = y;
 }
 
+short getCursor_x() {
+  return cursor_x;
+}
+
+short getCursor_y() {
+  return cursor_y;
+}
+
 inline void setTextSize(unsigned char s) {
 /*Set size of text to be displayed
  * Parameters:

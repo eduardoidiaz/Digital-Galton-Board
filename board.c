@@ -2,9 +2,15 @@
 /**
  * Eduardo Diaz
  * 
- * This demonstration animates two balls bouncing about the screen.
- * Through a serial interface, the user can change the ball color.
- *
+ * Inspired by: https://vanhunteradams.com/Pico/Galton/Galton.html
+ * 
+ * This program animates the collision physics of a Galton Board, demonstrating five
+ * famous mathematical concepts: Bernoilli trials, the binomial distribution, the
+ * Gaussian distribution, Pascal's triangle, and the central limit theorem.
+ * Whenever any ball strikes a peg a 'thunk!' sound is made. This is done through
+ * a DMA channel which avoids wasting cycles doing interrupt-based audio synthesis.
+ * Featuring a potentiometer-based interface to allow for parameter tuning in realtime.
+ * 
  * HARDWARE CONNECTIONS
   - GPIO 16 ---> VGA Hsync
   - GPIO 17 ---> VGA Vsync
@@ -51,29 +57,25 @@ typedef signed int fix15 ;
 #define char2fix15(a) (fix15)(((fix15)(a)) << 15)
 #define divfix(a,b) (fix15)(div_s64s64( (((signed long long)(a)) << 15), ((signed long long)(b))))
 
-// Wall detection
-#define hitBottom(b) (b>int2fix15(380))
-#define hitTop(b) (b<int2fix15(100))
-#define hitLeft(a) (a<int2fix15(100))
-#define hitRight(a) (a>int2fix15(540))
-
 // uS per frame
 #define FRAME_RATE 33000
 
 // Galton Board Parameters
 #define GALTON_BOARD_START_X 320
-#define GALTON_BOARD_START_Y 250
-#define GALTON_BOARD_ROWS 10
+#define GALTON_BOARD_START_Y 0
+#define GALTON_BOARD_ROWS 16
 #define PEG_RADIUS 3
-#define NUM_BALLS 30
+#define NUM_BALLS 10
 #define NUM_PEGS (GALTON_BOARD_ROWS*(GALTON_BOARD_ROWS + 1))/2
 # define NUM_BINS GALTON_BOARD_ROWS + 1
 
 // Ball Parameters
 #define BALL_RADIUS 1
 #define BALL_START_X 320
-#define BALL_START_Y 240
+#define BALL_START_Y 10
 #define BALL_START_VY 0
+
+#define GRAVITY 0.25
 
 // Ball properties
 struct Ball {
@@ -133,6 +135,7 @@ volatile int bottom = 0;
 volatile int num = 0;
 volatile int start = 0;
 volatile int bin = 0;
+volatile int balls_respawned = 0;
 
 // Create a ball dropping it from the center of screen
 void spawn_ball(struct Ball *b) {
@@ -141,14 +144,6 @@ void spawn_ball(struct Ball *b) {
     b->vx = float2fix15(min + ((double)rand() / RAND_MAX) * (max - min));
     b->vy = int2fix15(BALL_START_VY);
     b->r = int2fix15(BALL_RADIUS);
-}
-
-// Draw the boundaries
-void drawArena() {
-    drawVLine(100, 100, 280, WHITE) ;
-    drawVLine(540, 100, 280, WHITE) ;
-    drawHLine(100, 100, 440, WHITE) ;
-    drawHLine(100, 380, 440, WHITE) ;
 }
 
 // Detect bottoming out
@@ -167,7 +162,13 @@ void bottoming_out(struct Ball *b) {
         b->vx = float2fix15(min + ((double)rand() / RAND_MAX) * (max - min));
         // Moving down
         b->vy = int2fix15(BALL_START_VY);
+        balls_respawned += 1;
     }
+}
+
+// Display info
+void display() {
+
 }
 
 // ==================================================
@@ -291,17 +292,23 @@ static PT_THREAD (protothread_anim(struct pt *pt))
             // TODO...
 
             if (fix2int15(ball_array[b].y) - m_left*fix2int15(ball_array[b].x) < b_lft) {
+                if (fix2int15(ball_array[b].y) < m_left*fix2int15(ball_array[b].x) + b_lft) {
+                    ball_array[b].vy = -ball_array[b].vy;
+                }
+                // if (fix2int15(ball_array[b].y) < m_left*fix2int15(ball_array[b].x) + b_lft) {
+                //     ball_array[b].vx = -ball_array[b].vx;
+                // }
                 ball_array[b].vx = -ball_array[b].vx;
-                // ball_array[b].vy = -ball_array[b].vy;
             }
             if (fix2int15(ball_array[b].y) - m_right*fix2int15(ball_array[b].x) < b_rght) {
+                if (fix2int15(ball_array[b].y) < m_right*fix2int15(ball_array[b].x) + b_rght) {
+                    ball_array[b].vy = -ball_array[b].vy;
+                }
                 ball_array[b].vx = -ball_array[b].vx;
-                // ball_array[b].vy = -ball_array[b].vy;
             }
 
             // Apply gravity
-            // ball_array[b].vy = ball_array[b].vy + int2fix15(1);
-            ball_array[b].vy = ball_array[b].vy + float2fix15(0.15);
+            ball_array[b].vy = ball_array[b].vy + float2fix15(GRAVITY);
 
             // Use ball's updated velocity to update its position
             ball_array[b].x = ball_array[b].x + ball_array[b].vx;
@@ -310,8 +317,7 @@ static PT_THREAD (protothread_anim(struct pt *pt))
             drawCircle(fix2int15(ball_array[b].x), fix2int15(ball_array[b].y), fix2int15(ball_array[b].r), color);
             fillCircle(fix2int15(ball_array[b].x), fix2int15(ball_array[b].y), fix2int15(ball_array[b].r), color);
         }
-        // draw the boundaries
-        // drawArena() ;
+
         // delay in accordance with frame rate
         spare_time = FRAME_RATE - (time_us_32() - begin_time) ;
         // yield for necessary amount of time
@@ -341,13 +347,11 @@ static PT_THREAD (protothread_anim1(struct pt *pt))
             drawCircle(fix2int15(peg_array[i].x), fix2int15(peg_array[i].y) , PEG_RADIUS, WHITE);
         }
 
-        // Draw bins;
+        // Draw bins filling
         for (int i=0; i<NUM_BINS; i++) {
-            // drawVLine(fix2int15(bins_array[i].x_i), bottom, 10, WHITE);
-            // drawVLine(fix2int15(bins_array[i].x_f), bottom, 10, WHITE);
-            // Draw bins filling
             if (bins_array[i].num_balls > 0) {
-                fillRect(fix2int15(bins_array[i].x_i)+(7), 470 - bins_array[i].num_balls, (fix2int15(bins_array[0].x_f) - fix2int15(bins_array[0].x_i))-1, bins_array[i].num_balls, GREEN);
+                // fillRect(fix2int15(bins_array[i].x_i)+(7), 470 - bins_array[i].num_balls, (fix2int15(bins_array[0].x_f) - fix2int15(bins_array[0].x_i))-1, bins_array[i].num_balls, GREEN);
+                fillRect(fix2int15(bins_array[i].x_i)+1, 470 - bins_array[i].num_balls, (fix2int15(bins_array[0].x_f) - fix2int15(bins_array[0].x_i))-1, bins_array[i].num_balls, GREEN);
             }
         }
 
@@ -358,8 +362,8 @@ static PT_THREAD (protothread_anim1(struct pt *pt))
         char str2[str_len];
 
         // Clear Text
-        drawRect(0, 0, 400, 200, BLACK);
-        fillRect(0, 0, 400, 200, BLACK);
+        drawRect(0, 0, 100, 150, BLACK);
+        fillRect(0, 0, 100, 150, BLACK);
         setCursor(0, 10);
         setTextColor(WHITE);
         setTextSize(1);
@@ -407,12 +411,17 @@ int main(){
     // initialize VGA
     initVGA() ;
 
+    // white screen
+    drawRect(0, 0, 640, 480, WHITE);
+    fillRect(0, 0, 640, 480, WHITE);
+
     // Starting Center of Screen
     int x_coord = GALTON_BOARD_START_X;
     int y_coord = GALTON_BOARD_START_Y;
     int x_coord_inc = 14;
     int y_coord_inc = 14;
     int x_start_adj = x_coord_inc/2;
+    // int x_start_adj = 14;
     int peg_idx = 0;
     int bottom_left_peg_x = 0;
     int bottom_left_peg_y = 0;
@@ -424,9 +433,6 @@ int main(){
     for (int row=0; row<GALTON_BOARD_ROWS; row++) { // Rows in Galton Board
         x_coord = 320 - x_start_adj*row; // Move starting location of pegs (no movement initially)
         for (int peg=0; peg<row+1; peg++) { // Pegs per row in Galton Board (1 more than row number)
-            // drawCircle(x_coord, y_coord, PEG_RADIUS, WHITE);
-            // fillCircle(x_coord, y_coord, PEG_RADIUS, WHITE);
-
             if (row == 0 && peg == 0) {
                 top_peg_x = x_coord;
                 top_peg_y = y_coord;
@@ -449,20 +455,15 @@ int main(){
         }
         y_coord += y_coord_inc; // move next drawing location vertically
     }
-    last_peg = &peg_array[0];
-
-    // sleep_ms(5000);
-    // printf("top_peg(x, y): (%d, %d)\n", top_peg_x, top_peg_y);
-    // printf("bottom_left_peg(x, y): (%d, %d)\n", bottom_left_peg_x, bottom_left_peg_y);
-    // printf("bottom_right_peg(x, y): (%d, %d)\n", bottom_right_peg_x, bottom_right_peg_y);
 
     int top_x = GALTON_BOARD_START_X;
-    int top_y = GALTON_BOARD_START_Y - 20;
-    int bottom_left_x = bottom_left_peg_x - 10;
-    // int bottom_left_x = bottom_left_peg_x - x_coord_inc;
+    int top_y = GALTON_BOARD_START_Y - 2*y_coord_inc;
+    // int bottom_left_x = bottom_left_peg_x - 10;
+    int bottom_left_x = bottom_left_peg_x - x_coord_inc;
     int bottom_left_y = bottom_left_peg_y;
     // int bottom_left_y = bottom_left_peg_y + y_coord_inc;
-    int bottom_right_x = bottom_right_peg_x + 10;
+    // int bottom_right_x = bottom_right_peg_x + 10;
+    int bottom_right_x = bottom_right_peg_x + x_coord_inc;
     int bottom_right_y = bottom_right_peg_y;
     // m = (y2 - y1)/(x2 - x1)
     int slope_left = (top_y - bottom_left_y)/(top_x - bottom_left_x);
@@ -515,12 +516,14 @@ int main(){
     // bins_array[bin+10].x_f = peg_array[54].x + int2fix15(10);
 
     for (int i=0; i < GALTON_BOARD_ROWS+1; i++) {
-        if (i==0) { //45
-            bins_array[i].x_i = peg_array[start+i].x - int2fix15(10);
+        if (i==0) { // first peg in last row
+            // bins_array[i].x_i = peg_array[start+i].x - int2fix15(10);
+            bins_array[i].x_i = peg_array[start+i].x - int2fix15(x_coord_inc);
             bins_array[i].x_f = peg_array[start+i].x;   
-        } else if (i==10) { //54
+        } else if (i==GALTON_BOARD_ROWS) { // last peg in last row
             bins_array[i].x_i = peg_array[start+i-1].x;
-            bins_array[i].x_f = peg_array[start+i-1].x  + int2fix15(10);
+            // bins_array[i].x_f = peg_array[start+i-1].x  + int2fix15(10);
+            bins_array[i].x_f = peg_array[start+i-1].x  + int2fix15(x_coord_inc);
         } else {
             bins_array[i].x_i = peg_array[start+i-1].x;
             bins_array[i].x_f = peg_array[start+i].x;
