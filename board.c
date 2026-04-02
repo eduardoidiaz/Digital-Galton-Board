@@ -67,6 +67,7 @@ typedef signed int fix15 ;
 #define PEG_RADIUS 3
 #define NUM_BALLS 30
 #define NUM_PEGS (GALTON_BOARD_ROWS*(GALTON_BOARD_ROWS + 1))/2
+# define NUM_BINS GALTON_BOARD_ROWS + 1
 
 // Ball Parameters
 #define BALL_RADIUS 1
@@ -90,6 +91,13 @@ struct Peg {
     fix15 r;
 };
 
+// Bin Properties
+struct Bin {
+    // Initial/Final x-coordinates for bin
+    fix15 x_i, x_f;
+    int num_balls;
+};
+
 // the color of the boid
 char color = WHITE ;
 
@@ -99,6 +107,8 @@ struct Ball ball0;
 struct Ball ball_array[NUM_BALLS];
 
 struct Peg peg_array[NUM_PEGS];
+
+struct Bin bins_array[NUM_BINS];
 
 volatile fix15 dx = 0;
 volatile fix15 dy = 0;
@@ -119,6 +129,10 @@ volatile int b_rght = 0;
 volatile int collisions = 0;
 
 volatile int bottom = 0;
+
+volatile int num = 0;
+volatile int start = 0;
+volatile int bin = 0;
 
 // Create a ball dropping it from the center of screen
 void spawn_ball(struct Ball *b) {
@@ -141,6 +155,12 @@ void drawArena() {
 void bottoming_out(struct Ball *b) {
     // If the ball bottoms out 'respawn'
     if (b->y > int2fix15(bottom)) {
+        // Check which bin ball fell into
+        for (int i=0; i<NUM_BINS; i++) {
+            if ((b->x < bins_array[i].x_f) && (b->x > bins_array[i].x_i)) {
+                bins_array[i].num_balls = bins_array[i].num_balls + 1;
+            }
+        }
         // Start in the center of screen
         b->x = int2fix15(BALL_START_X);
         b->y = int2fix15(BALL_START_Y);
@@ -148,9 +168,6 @@ void bottoming_out(struct Ball *b) {
         // Moving down
         b->vy = int2fix15(BALL_START_VY);
     }
-    // Update position using velocity
-    // b->x = b->x + b->vx;
-    // b->y = b->y + b->vy;
 }
 
 // ==================================================
@@ -294,7 +311,7 @@ static PT_THREAD (protothread_anim(struct pt *pt))
             fillCircle(fix2int15(ball_array[b].x), fix2int15(ball_array[b].y), fix2int15(ball_array[b].r), color);
         }
         // draw the boundaries
-        drawArena() ;
+        // drawArena() ;
         // delay in accordance with frame rate
         spare_time = FRAME_RATE - (time_us_32() - begin_time) ;
         // yield for necessary amount of time
@@ -324,19 +341,39 @@ static PT_THREAD (protothread_anim1(struct pt *pt))
             drawCircle(fix2int15(peg_array[i].x), fix2int15(peg_array[i].y) , PEG_RADIUS, WHITE);
         }
 
-        // printf("collisions = %d\n", collisions);
+        // Draw bins;
+        for (int i=0; i<NUM_BINS; i++) {
+            // drawVLine(fix2int15(bins_array[i].x_i), bottom, 10, WHITE);
+            // drawVLine(fix2int15(bins_array[i].x_f), bottom, 10, WHITE);
+            // Draw bins filling
+            if (bins_array[i].num_balls > 0) {
+                fillRect(fix2int15(bins_array[i].x_i)+(7), 470 - bins_array[i].num_balls, (fix2int15(bins_array[0].x_f) - fix2int15(bins_array[0].x_i))-1, bins_array[i].num_balls, GREEN);
+            }
+        }
 
-        // printf("ball_array[0].x: %f\n", fix2float15(ball_array[0].x));
-        // printf("ball_array[0].y: %f\n", fix2float15(ball_array[0].y));
-        // printf("ball_array[0].vx: %f\n", fix2float15(ball_array[0].vx));
-        // printf("ball_array[0].vy: %f\n", fix2float15(ball_array[0].vy));
-        // printf("ball_array[0].r: %f\n", fix2float15(ball_array[0].r));
-        // printf("dx: %f\n", fix2float15(dx));
-        // printf("dy: %f\n", fix2float15(dy));
+        // Write Hello
+        char *str = "HELLO!";
+        int str_len = 6;
+        char *str1 = "BIN #";
+        char str2[str_len];
 
+        // Clear Text
+        drawRect(0, 0, 400, 200, BLACK);
+        fillRect(0, 0, 400, 200, BLACK);
+        setCursor(0, 10);
+        setTextColor(WHITE);
+        setTextSize(1);
 
-
-
+        for (int b=0; b<NUM_BINS; b++) {
+            str2[0] = b + '0';
+            str2[1] = ' ';
+            str2[2] = bins_array[b].num_balls/10 % 10 + '0';
+            str2[3] = bins_array[b].num_balls % 10 + '0';
+            str2[4] = '\n';
+            str2[5] = '\0';
+            writeString(str1);
+            writeString(str2);
+        }
 
         // delay in accordance with frame rate
         spare_time = FRAME_RATE - (time_us_32() - begin_time) ;
@@ -387,7 +424,7 @@ int main(){
     for (int row=0; row<GALTON_BOARD_ROWS; row++) { // Rows in Galton Board
         x_coord = 320 - x_start_adj*row; // Move starting location of pegs (no movement initially)
         for (int peg=0; peg<row+1; peg++) { // Pegs per row in Galton Board (1 more than row number)
-            drawCircle(x_coord, y_coord, PEG_RADIUS, WHITE);
+            // drawCircle(x_coord, y_coord, PEG_RADIUS, WHITE);
             // fillCircle(x_coord, y_coord, PEG_RADIUS, WHITE);
 
             if (row == 0 && peg == 0) {
@@ -422,7 +459,9 @@ int main(){
     int top_x = GALTON_BOARD_START_X;
     int top_y = GALTON_BOARD_START_Y - 20;
     int bottom_left_x = bottom_left_peg_x - 10;
+    // int bottom_left_x = bottom_left_peg_x - x_coord_inc;
     int bottom_left_y = bottom_left_peg_y;
+    // int bottom_left_y = bottom_left_peg_y + y_coord_inc;
     int bottom_right_x = bottom_right_peg_x + 10;
     int bottom_right_y = bottom_right_peg_y;
     // m = (y2 - y1)/(x2 - x1)
@@ -466,6 +505,29 @@ int main(){
     for (int i=0; i<NUM_BALLS; i++) {
         spawn_ball(&ball_array[i]);
     }
+
+    num = (GALTON_BOARD_ROWS*(GALTON_BOARD_ROWS+1)/2) - 1;
+    start = (GALTON_BOARD_ROWS*(GALTON_BOARD_ROWS+1)/2 - GALTON_BOARD_ROWS);
+
+    // bins_array[bin].x_i = peg_array[start].x - int2fix15(10);
+    // bins_array[bin].x_f = peg_array[start].x;
+    // bins_array[bin+10].x_i = peg_array[54].x;
+    // bins_array[bin+10].x_f = peg_array[54].x + int2fix15(10);
+
+    for (int i=0; i < GALTON_BOARD_ROWS+1; i++) {
+        if (i==0) { //45
+            bins_array[i].x_i = peg_array[start+i].x - int2fix15(10);
+            bins_array[i].x_f = peg_array[start+i].x;   
+        } else if (i==10) { //54
+            bins_array[i].x_i = peg_array[start+i-1].x;
+            bins_array[i].x_f = peg_array[start+i-1].x  + int2fix15(10);
+        } else {
+            bins_array[i].x_i = peg_array[start+i-1].x;
+            bins_array[i].x_f = peg_array[start+i].x;
+        }
+        bins_array[i].num_balls = 0;
+    }
+    
 
     sleep_ms(3000);
 
