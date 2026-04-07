@@ -54,12 +54,6 @@ typedef signed int fix15 ;
 #define char2fix15(a) (fix15)(((fix15)(a)) << 15)
 #define divfix(a,b) (fix15)(div_s64s64( (((signed long long)(a)) << 15), ((signed long long)(b))))
 
-// Wall detection
-#define hitBottom(b) (b>int2fix15(380))
-#define hitTop(b) (b<int2fix15(100))
-#define hitLeft(a) (a<int2fix15(100))
-#define hitRight(a) (a>int2fix15(540))
-
 // uS per frame
 #define FRAME_RATE 33000
 
@@ -119,6 +113,11 @@ volatile int adc_avg = 0;
 volatile uint16_t potent_val = 0;
 volatile float potent_pecentage = 0.0;
 volatile bool read_adc = false;
+volatile bool adj_num_balls = false;
+volatile bool adj_gravity = false;
+volatile float gravity = 0.75;
+volatile uint32_t elapsed_time_s = 0;
+volatile uint32_t boot_time = 0;
 
 
 // Ball properties
@@ -269,22 +268,8 @@ static inline void wall_collision(struct Ball *b) {
 // ==================================================
 void draw_diagonal_walls() {
 
-    int y_top = DIAGONAL_START_Y; // 6
-    int y_bot = bottom;                                // ~160
-
-    // for (int y = y_top; y <= y_bot; y++) {
-
-    //     // From equations:
-    //     // Left:  y = -2x + 646  → x = (646 - y)/2
-    //     int x_left  = (-y + b_left) >> 1;
-
-    //     // Right: y =  2x - 634  → x = (y + 634)/2
-    //     int x_right = (y - b_right) >> 1;
-
-    //     // Draw pixels
-    //     drawPixel(x_left,  y, WHITE);
-    //     drawPixel(x_right, y, WHITE);
-    // }
+    int y_top = DIAGONAL_START_Y;
+    int y_bot = bottom;                               
 
     // Draw Left Diagonal of Galton Board (starting from bottom left)
     for (int y = y_bot; y >= y_top; y--) {
@@ -370,7 +355,13 @@ void gpio_callback() {
 
     // Read ADC
     read_adc = true;
-    // adc_select_input(2);
+    adc_select_input(2);
+    if (!adj_num_balls && !adj_gravity) {
+        adj_num_balls = true;
+    } else {
+        adj_gravity = !adj_gravity;
+        adj_num_balls = !adj_num_balls;
+    }
 }
 
 
@@ -389,7 +380,7 @@ static PT_THREAD (protothread_anim(struct pt *pt))
         begin_time = time_us_32() ;      
 
         for (int b=0; b<NUM_BALLS; b++) {
-            if (b>=animated_balls) {
+            if (b >= animated_balls) {
                 // Erase Ball (inactive)
                 drawCircle(fix2int15(ball_array[b].x), fix2int15(ball_array[b].y), fix2int15(ball_array[b].r), BLACK);
                 fillCircle(fix2int15(ball_array[b].x), fix2int15(ball_array[b].y), fix2int15(ball_array[b].r), BLACK);
@@ -461,11 +452,10 @@ static PT_THREAD (protothread_anim(struct pt *pt))
             bottoming_out(&ball_array[b]);
 
             // Bounce any balls the hit top/sides
-            // TODO...
             wall_collision(&ball_array[b]);
 
             // Apply gravity
-            ball_array[b].vy = ball_array[b].vy + float2fix15(GRAVITY);
+            ball_array[b].vy = ball_array[b].vy + float2fix15(gravity);
 
             // Use ball's updated velocity to update its position
             ball_array[b].x = ball_array[b].x + ball_array[b].vx;
@@ -496,15 +486,25 @@ static PT_THREAD (protothread_anim1(struct pt *pt))
 
     while(1) {
         if (read_adc) {
-            adc_select_input(2);
-            for (int i=0; i<256; i++) {
-                adc_avg += adc_read();
+            if (adj_num_balls) {
+                // adc_select_input(2);
+                for (int i=0; i<256; i++) {
+                    adc_avg += adc_read();
+                }
+                potent_val = adc_avg / 256;
+                potent_pecentage = ((float) potent_val / (float) adc_max) * 100.0;
+                printf("potent_percentage = %d\n", (int) potent_pecentage);
+                animated_balls = (int) potent_pecentage;
+                adc_avg = 0;
             }
-            potent_val = adc_avg / 256;
-            potent_pecentage = ((float) potent_val / (float) adc_max) * 100.0;
-            printf("potent_percentage = %d\n", (int) potent_pecentage);
-            animated_balls = (int) potent_pecentage;
-            adc_avg = 0;
+            if (adj_gravity) {
+                for (int i=0; i<256; i++) {
+                    adc_avg += adc_read();
+                }
+                potent_val = adc_avg / 256;
+                gravity = (float) potent_val / (float) adc_max;
+                adc_avg = 0;
+            }
         }
         // printf("peg_array[0].x = %d\n", fix2int15(peg_array[0].x));
         // printf("peg_array[0].y = %d\n", fix2int15(peg_array[0].y)-PEG_SEPARATION);
@@ -536,24 +536,27 @@ static PT_THREAD (protothread_anim1(struct pt *pt))
             }
         }
 
+        // Build string displayed for balls that went into a specific bin
         char *str1 = "BIN #";
-        int str_len = 6;
+        int str_len = 8;
         char str2[str_len];
 
         // // Clear Text
-        drawRect(0, 0, 120, 200, WHITE);
-        fillRect(0, 0, 120, 200, WHITE);
+        drawRect(0, 0, 130, 200, WHITE);
+        fillRect(0, 0, 130, 200, WHITE);
         setCursor(0, 5);
         setTextColor(BLACK);
         setTextSize(1);
 
         for (int b=0; b<NUM_BINS; b++) {
-            str2[0] = b + '0';
-            str2[1] = ' ';
-            str2[2] = bins_array[b].num_balls/10 % 10 + '0';
-            str2[3] = bins_array[b].num_balls % 10 + '0';
-            str2[4] = '\n';
-            str2[5] = '\0';
+            str2[0] = b/10 % 10 + '0';
+            str2[1] = b % 10 + '0';
+            str2[2] = ' ';
+            str2[3] = bins_array[b].num_balls/100 % 10 + '0';
+            str2[4] = bins_array[b].num_balls/10 % 10 + '0';
+            str2[5] = bins_array[b].num_balls % 10 + '0';
+            str2[6] = '\n';
+            str2[7] = '\0';
             writeString(str1);
             writeString(str2);
         }
@@ -568,6 +571,26 @@ static PT_THREAD (protothread_anim1(struct pt *pt))
         }
         writeString(str3);
         writeString(str4);
+
+        char *str5 = "Gravity = 0.";
+        char str6[4];
+        str6[0] = ((int) (gravity*10)) % 10 + '0';
+        str6[1] = ((int) (gravity*100)) % 10 + '0';
+        str6[2] = '\n';
+        str6[3] = '\0';
+        writeString(str5);
+        writeString(str6);
+
+        elapsed_time_s = (time_us_32() - boot_time) / 1000000;
+        char *str7 = "Elapsed time(s) = ";
+        char str8[5];
+        str8[0] = elapsed_time_s/100 % 100 + '0';
+        str8[1] = elapsed_time_s/10 % 10 + '0';
+        str8[2] = elapsed_time_s % 10 + '0';
+        str8[3] = '\n';
+        str8[4] = '\0';
+        writeString(str7);
+        writeString(str8);
 
         // delay in accordance with frame rate
         spare_time = FRAME_RATE - (time_us_32() - begin_time) ;
@@ -613,7 +636,6 @@ int main(){
     // ADC init
     adc_init();
     adc_gpio_init(28);
-
 
     // initialize VGA
     initVGA() ;
@@ -747,6 +769,9 @@ int main(){
     }
 
     sleep_ms(1000);
+
+    // Beginning time
+    boot_time = time_us_32();
 
     // start core 1 
     multicore_reset_core1();
