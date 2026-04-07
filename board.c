@@ -33,10 +33,13 @@
 #include "pico/divider.h"
 #include "pico/multicore.h"
 // Include hardware libraries
+#include "hardware/gpio.h"
 #include "hardware/pio.h"
 #include "hardware/dma.h"
+#include "hardware/spi.h"
 #include "hardware/clocks.h"
 #include "hardware/pll.h"
+#include "hardware/adc.h"
 // Include protothreads
 #include "pt_cornell_rp2040_v1_4.h"
 
@@ -62,18 +65,61 @@ typedef signed int fix15 ;
 
 // Galton Board Parameters
 #define GALTON_BOARD_START_X 320
-#define GALTON_BOARD_START_Y 250
-#define GALTON_BOARD_ROWS 10
+#define GALTON_BOARD_START_Y 30
+#define GALTON_BOARD_ROWS 16
+#define PEG_SEPARATION_X 30
+#define PEG_SEPARATION_Y 15
 #define PEG_RADIUS 3
-#define NUM_BALLS 30
+#define NUM_BALLS 100
 #define NUM_PEGS (GALTON_BOARD_ROWS*(GALTON_BOARD_ROWS + 1))/2
-# define NUM_BINS GALTON_BOARD_ROWS + 1
+#define NUM_BINS GALTON_BOARD_ROWS + 1
+#define DIAGONAL_START_X GALTON_BOARD_START_X
+#define DIAGONAL_START_Y GALTON_BOARD_START_Y - PEG_SEPARATION_Y
+#define WALL_BOUNCE float2fix15(0.6)   // tweak: 0.4–0.8 feels good
+// #define GRAVITY 0.125
+#define GRAVITY 0.75
+#define BOUNCINESS 0.5
 
 // Ball Parameters
-#define BALL_RADIUS 1
-#define BALL_START_X 320
-#define BALL_START_Y 240
+#define BALL_RADIUS 2
+#define BALL_START_X GALTON_BOARD_START_X 
+#define BALL_START_Y GALTON_BOARD_START_Y - 15
 #define BALL_START_VY 0
+
+#define BIN_START_Y 470
+
+// Number of DMA transfers per event
+#define THUNK_SIZE 256
+
+volatile int animated_balls = 0;
+
+// Table of values to be sent to DAC
+unsigned short DAC_data[THUNK_SIZE] ;
+
+// Pointer to the address of the DAC data table
+unsigned short * address_ptr = &DAC_data[0] ;
+
+// A-channel, 1x, active
+#define DAC_config_chan_A 0b0011000000000000
+
+//SPI configurations
+#define PIN_MISO 4
+#define PIN_CS   5
+#define PIN_SCK  6
+#define PIN_MOSI 7
+#define SPI_PORT spi0
+
+volatile int b_left = 0;
+volatile int left_diag_slope = 0;
+volatile int b_right = 0;
+volatile int right_diag_slope = 0;
+
+const uint adc_max = (1<<12) - 1; // 4095
+volatile int adc_avg = 0;
+volatile uint16_t potent_val = 0;
+volatile float potent_pecentage = 0.0;
+volatile bool read_adc = false;
+
 
 // Ball properties
 struct Ball {
@@ -82,6 +128,7 @@ struct Ball {
     fix15 vx;
     fix15 vy;
     fix15 r;
+    int last_peg_id;
 };
 
 // Peg Properties
@@ -89,6 +136,7 @@ struct Peg {
     fix15 x;
     fix15 y;
     fix15 r;
+    int id;
 };
 
 // Bin Properties
@@ -116,23 +164,16 @@ volatile float distance = 0;
 volatile fix15 normal_x = 0;
 volatile fix15 normal_y = 0;
 volatile fix15 intermediate = 0;
-volatile struct Peg *last_peg;
 
 double min = -1.0;
 double max = 1.0;
-
-volatile int m_left = 0;
-volatile int b_lft = 0;
-volatile int m_right = 0;
-volatile int b_rght = 0;
 
 volatile int collisions = 0;
 
 volatile int bottom = 0;
 
-volatile int num = 0;
-volatile int start = 0;
-volatile int bin = 0;
+// Select DMA channels
+volatile int data_chan = 0;
 
 // Create a ball dropping it from the center of screen
 void spawn_ball(struct Ball *b) {
@@ -141,15 +182,137 @@ void spawn_ball(struct Ball *b) {
     b->vx = float2fix15(min + ((double)rand() / RAND_MAX) * (max - min));
     b->vy = int2fix15(BALL_START_VY);
     b->r = int2fix15(BALL_RADIUS);
+    b->last_peg_id = -1; // invalid peg
 }
 
-// Draw the boundaries
-void drawArena() {
-    drawVLine(100, 100, 280, WHITE) ;
-    drawVLine(540, 100, 280, WHITE) ;
-    drawHLine(100, 100, 440, WHITE) ;
-    drawHLine(100, 380, 440, WHITE) ;
+// ==================================================
+// Wall collision (fixed-point, no floats)
+// ==================================================
+static inline void wall_collision(struct Ball *b) {
+
+    // Convert once (faster)
+    int x = fix2int15(b->x);
+    int y = fix2int15(b->y);
+
+    fix15 vx = b->vx;
+    fix15 vy = b->vy;
+
+    // ---------- LEFT WALL ----------
+    // d = 2x + y - 646
+    int d_left = (left_diag_slope * x - y + b_left);
+
+    if (d_left > 0) {
+
+        // Normal = (2,1)
+        fix15 dot = multfix15(vx, int2fix15(2)) + multfix15(vy, int2fix15(1));
+
+        // Only reflect if moving into wall
+        if (dot < int2fix15(0)) {
+            // |n|^2 = 2^2 + 1^2 = 5
+
+            // Reflect velocity: v = v - 2*(dot/5)*n
+            fix15 scale = divfix(multfix15(int2fix15(2), dot), int2fix15(5));
+
+            vx -= multfix15(scale, int2fix15(2));
+            vy -= multfix15(scale, int2fix15(1));
+
+            // Write back
+            // APPLY ENERGY LOSS
+            b->vx = multfix15(WALL_BOUNCE, vx);
+            b->vy = multfix15(WALL_BOUNCE, vy);
+        }
+
+        // Push away from wall (prevents sticking)
+        int push = (d_left + 1);  // +1 = bias outward
+
+        // Move along normal
+        x += (push * 2) / 5;
+        y += (push * 1) / 5;
+
+        b->x = int2fix15(x);
+        b->y = int2fix15(y);
+    }
+
+    // ---------- RIGHT WALL ----------
+    // d = -2x + y + 634
+    int d_right = (right_diag_slope * x - y + b_right);
+
+    if (d_right > 0) {
+
+        // Normal = (-2,1)
+        fix15 dot = multfix15(vx, int2fix15(-2)) + multfix15(vy, int2fix15(1));
+
+        if (dot < int2fix15(0)) {
+            // |n|^2 = 5
+            fix15 scale = divfix(multfix15(int2fix15(2), dot), int2fix15(5));
+
+            vx -= multfix15(scale, int2fix15(-2));
+            vy -= multfix15(scale, int2fix15(1));
+
+            // APPLY ENERGY LOSS
+            b->vx = multfix15(WALL_BOUNCE, vx);
+            b->vy = multfix15(WALL_BOUNCE, vy);
+        }
+
+        // Push away from wall (prevents sticking)
+        int push = (d_right + 1);
+
+        x += (push * -2) / 5;
+        y += (push *  1) / 5;
+
+        b->x = int2fix15(x);
+        b->y = int2fix15(y);
+    }
 }
+// ==================================================
+// Draw diagonal Galton walls
+// ==================================================
+void draw_diagonal_walls() {
+
+    int y_top = DIAGONAL_START_Y; // 6
+    int y_bot = bottom;                                // ~160
+
+    // for (int y = y_top; y <= y_bot; y++) {
+
+    //     // From equations:
+    //     // Left:  y = -2x + 646  → x = (646 - y)/2
+    //     int x_left  = (-y + b_left) >> 1;
+
+    //     // Right: y =  2x - 634  → x = (y + 634)/2
+    //     int x_right = (y - b_right) >> 1;
+
+    //     // Draw pixels
+    //     drawPixel(x_left,  y, WHITE);
+    //     drawPixel(x_right, y, WHITE);
+    // }
+
+    // Draw Left Diagonal of Galton Board (starting from bottom left)
+    for (int y = y_bot; y >= y_top; y--) {
+        for (int x = fix2int15(bins_array[0].x_i); x <= GALTON_BOARD_START_X; x++) {
+            if (y-(left_diag_slope*x) == b_left) {
+                drawPixel(x, y, WHITE);
+            } else if (y-(left_diag_slope*x) < b_left) {
+                // drawPixel(x, y, RED);
+            } else {
+                // drawPixel(x, y, GREEN);
+            }
+        }
+    }
+    
+    // Draw Right Diagonal of Galton Board (starting from bottom right)
+    for (int y = y_bot; y >= y_top; y--) {
+        for (int x = fix2int15(bins_array[NUM_BINS-1].x_f); x >= GALTON_BOARD_START_X; x--) {
+            if (y-(right_diag_slope*x) == b_right) {
+                drawPixel(x, y, WHITE);
+            } else if (y-(right_diag_slope*x) < b_right) {
+                // drawPixel(x, y, RED);
+            } else {
+                // drawPixel(x, y, GREEN);
+            }
+        }
+    }
+}
+
 
 // Detect bottoming out
 void bottoming_out(struct Ball *b) {
@@ -201,6 +364,16 @@ static PT_THREAD (protothread_serial(struct pt *pt))
     PT_END(pt);
 } // timer thread
 
+// GPIO ISR. Toggles LED
+void gpio_callback() {
+    gpio_put(25, !gpio_get(25));
+
+    // Read ADC
+    read_adc = true;
+    // adc_select_input(2);
+}
+
+
 // Animation on core 0
 static PT_THREAD (protothread_anim(struct pt *pt))
 {
@@ -216,10 +389,18 @@ static PT_THREAD (protothread_anim(struct pt *pt))
         begin_time = time_us_32() ;      
 
         for (int b=0; b<NUM_BALLS; b++) {
+            if (b>=animated_balls) {
+                // Erase Ball (inactive)
+                drawCircle(fix2int15(ball_array[b].x), fix2int15(ball_array[b].y), fix2int15(ball_array[b].r), BLACK);
+                fillCircle(fix2int15(ball_array[b].x), fix2int15(ball_array[b].y), fix2int15(ball_array[b].r), BLACK);
+                spawn_ball(&ball_array[b]);
+                continue;
+            }
             // Erase Ball
             drawCircle(fix2int15(ball_array[b].x), fix2int15(ball_array[b].y), fix2int15(ball_array[b].r), BLACK);
             fillCircle(fix2int15(ball_array[b].x), fix2int15(ball_array[b].y), fix2int15(ball_array[b].r), BLACK);
             for (int p=0; p<NUM_PEGS; p++) {
+
                 float dx = fix2float15(ball_array[b].x) - fix2float15(peg_array[p].x);
                 float dy = fix2float15(ball_array[b].y) - fix2float15(peg_array[p].y);
 
@@ -235,7 +416,6 @@ static PT_THREAD (protothread_anim(struct pt *pt))
 
                 // Check actual collision
                 if (dist_sq < radius_sq) {
-
                     // Avoid divide-by-zero
                     if (dist_sq < 1e-6f) {
                         continue;
@@ -265,22 +445,15 @@ static PT_THREAD (protothread_anim(struct pt *pt))
                         ball_array[b].y += float2fix15(ny * overlap);
 
                         // Trigger sound once per new peg
-                        // if (ball->last_peg_id != peg->id) {
-                        //     dma_trigger();
-                        //     ball->last_peg_id = peg->id;
-
-                        //     // Apply energy loss
-                        //     ball->vx *= bounciness;
-                        //     ball->vy *= bounciness;
-                        // }
-                        if (&peg_array[p] != last_peg) {
+                        if (ball_array[b].last_peg_id != peg_array[p].id) {
                             // Make a sound
+                            dma_channel_set_read_addr(data_chan, DAC_data, true);
 
                             // Remove some energy from the ball
-                            ball_array[b].vx = 0.25 * ball_array[b].vx;
-                            ball_array[b].vy = 0.25 * ball_array[b].vy;
-                        } 
-                        last_peg = &peg_array[p];
+                            ball_array[b].vx = multfix15(float2fix15(BOUNCINESS), ball_array[b].vx);
+                            ball_array[b].vy = multfix15(float2fix15(BOUNCINESS), ball_array[b].vy);
+                        }
+                        ball_array[b].last_peg_id = peg_array[p].id;
                     }
                 }   
             }
@@ -289,19 +462,10 @@ static PT_THREAD (protothread_anim(struct pt *pt))
 
             // Bounce any balls the hit top/sides
             // TODO...
-
-            if (fix2int15(ball_array[b].y) - m_left*fix2int15(ball_array[b].x) < b_lft) {
-                ball_array[b].vx = -ball_array[b].vx;
-                // ball_array[b].vy = -ball_array[b].vy;
-            }
-            if (fix2int15(ball_array[b].y) - m_right*fix2int15(ball_array[b].x) < b_rght) {
-                ball_array[b].vx = -ball_array[b].vx;
-                // ball_array[b].vy = -ball_array[b].vy;
-            }
+            wall_collision(&ball_array[b]);
 
             // Apply gravity
-            // ball_array[b].vy = ball_array[b].vy + int2fix15(1);
-            ball_array[b].vy = ball_array[b].vy + float2fix15(0.15);
+            ball_array[b].vy = ball_array[b].vy + float2fix15(GRAVITY);
 
             // Use ball's updated velocity to update its position
             ball_array[b].x = ball_array[b].x + ball_array[b].vx;
@@ -310,8 +474,6 @@ static PT_THREAD (protothread_anim(struct pt *pt))
             drawCircle(fix2int15(ball_array[b].x), fix2int15(ball_array[b].y), fix2int15(ball_array[b].r), color);
             fillCircle(fix2int15(ball_array[b].x), fix2int15(ball_array[b].y), fix2int15(ball_array[b].r), color);
         }
-        // draw the boundaries
-        // drawArena() ;
         // delay in accordance with frame rate
         spare_time = FRAME_RATE - (time_us_32() - begin_time) ;
         // yield for necessary amount of time
@@ -333,6 +495,25 @@ static PT_THREAD (protothread_anim1(struct pt *pt))
     static int spare_time ;
 
     while(1) {
+        if (read_adc) {
+            adc_select_input(2);
+            for (int i=0; i<256; i++) {
+                adc_avg += adc_read();
+            }
+            potent_val = adc_avg / 256;
+            potent_pecentage = ((float) potent_val / (float) adc_max) * 100.0;
+            printf("potent_percentage = %d\n", (int) potent_pecentage);
+            animated_balls = (int) potent_pecentage;
+            adc_avg = 0;
+        }
+        // printf("peg_array[0].x = %d\n", fix2int15(peg_array[0].x));
+        // printf("peg_array[0].y = %d\n", fix2int15(peg_array[0].y)-PEG_SEPARATION);
+        // printf("bin[0]_xi = %d\n", fix2int15(bins_array[0].x_i));
+        // printf("bin[NUM_BINS-1]_xf = %d\n", fix2int15(bins_array[NUM_BINS-1].x_f));
+        // printf("bottom = %d\n\n", bottom);
+        // printf("left_diag_slope = %d\n", left_diag_slope);
+        // printf("b_left = %d\n", b_left);
+
         // Measure time at start of thread
         begin_time = time_us_32() ;      
 
@@ -341,27 +522,29 @@ static PT_THREAD (protothread_anim1(struct pt *pt))
             drawCircle(fix2int15(peg_array[i].x), fix2int15(peg_array[i].y) , PEG_RADIUS, WHITE);
         }
 
+        // Draw walls enclosing the Galton Board
+        draw_diagonal_walls();
+
         // Draw bins;
         for (int i=0; i<NUM_BINS; i++) {
-            // drawVLine(fix2int15(bins_array[i].x_i), bottom, 10, WHITE);
-            // drawVLine(fix2int15(bins_array[i].x_f), bottom, 10, WHITE);
+            drawVLine(fix2int15(bins_array[i].x_i), bottom, 10, WHITE);
+            drawVLine(fix2int15(bins_array[i].x_f), bottom, 10, WHITE);
+
             // Draw bins filling
             if (bins_array[i].num_balls > 0) {
-                fillRect(fix2int15(bins_array[i].x_i)+(7), 470 - bins_array[i].num_balls, (fix2int15(bins_array[0].x_f) - fix2int15(bins_array[0].x_i))-1, bins_array[i].num_balls, GREEN);
+                fillRect(fix2int15(bins_array[i].x_i)+1, BIN_START_Y - bins_array[i].num_balls, fix2int15(bins_array[i].x_f - bins_array[i].x_i) - 1, bins_array[i].num_balls, GREEN);
             }
         }
 
-        // Write Hello
-        char *str = "HELLO!";
-        int str_len = 6;
         char *str1 = "BIN #";
+        int str_len = 6;
         char str2[str_len];
 
-        // Clear Text
-        drawRect(0, 0, 400, 200, BLACK);
-        fillRect(0, 0, 400, 200, BLACK);
-        setCursor(0, 10);
-        setTextColor(WHITE);
+        // // Clear Text
+        drawRect(0, 0, 120, 200, WHITE);
+        fillRect(0, 0, 120, 200, WHITE);
+        setCursor(0, 5);
+        setTextColor(BLACK);
         setTextSize(1);
 
         for (int b=0; b<NUM_BINS; b++) {
@@ -374,6 +557,17 @@ static PT_THREAD (protothread_anim1(struct pt *pt))
             writeString(str1);
             writeString(str2);
         }
+
+        char *str3 = "Animated Balls = ";
+        char str4[4];
+        for (int i=0; i<4; i++) {
+            str4[0] = animated_balls/10 % 10 + '0';
+            str4[1] = animated_balls % 10 + '0';
+            str4[2] = '\n';
+            str4[3] = '\0';
+        }
+        writeString(str3);
+        writeString(str4);
 
         // delay in accordance with frame rate
         spare_time = FRAME_RATE - (time_us_32() - begin_time) ;
@@ -404,14 +598,90 @@ int main(){
     // initialize stio
     stdio_init_all() ;
 
+    // Configure GPIO interrupt
+    gpio_set_irq_enabled_with_callback(2, GPIO_IRQ_EDGE_RISE, true, &gpio_callback);
+
+    // Set GPIO's 3 to output
+    gpio_init(3) ;
+    gpio_init(25) ;
+    gpio_set_dir(2, GPIO_IN);
+    gpio_set_dir(25, GPIO_OUT);
+
+    // Set LED to off
+    gpio_put(25, 0);
+
+    // ADC init
+    adc_init();
+    adc_gpio_init(28);
+
+
     // initialize VGA
     initVGA() ;
+
+    // Initialize SPI channel (channel, baud rate set to 20MHz)
+    spi_init(SPI_PORT, 20000000) ;
+
+    // Format SPI channel (channel, data bits per transfer, polarity, phase, order)
+    spi_set_format(SPI_PORT, 16, 0, 0, 0);
+
+    // Map SPI signals to GPIO ports, acts like framed SPI with this CS mapping
+    gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_CS, GPIO_FUNC_SPI) ;
+    gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
+
+    // Build DAC data table
+    for (int i = 0; i < THUNK_SIZE; i++) {
+        // Exponential decay envelope
+        float decay = expf(-5.0f * i / THUNK_SIZE);
+
+        // Low-frequency + noise mix (gives it that "impact" feel)
+        // float tone = sinf(2 * M_PI * i / 20.0f);   // low freq bump
+        float tone = sinf(2 * M_PI * i / 95.0f); // lower tone (deeper thunk)
+        float noise = ((rand() % 2000) - 1000) / 1000.0f;
+
+        float sample = (0.9f * tone + 0.1f * noise) * decay;
+        // float sample = (0.4f * tone + 0.6f * noise) * decay; // enhance click
+
+        // if (i < 8) sample *= 2.0f;  // punch at start
+
+        // Scale to 12-bit DAC
+        int value = (int)(2047 + 2047 * sample);
+
+        if (value < 0) value = 0;
+        if (value > 4095) value = 4095;
+
+        DAC_data[i] = DAC_config_chan_A | (value & 0x0fff);
+    }
+
+    // Select DMA channels
+    data_chan = dma_claim_unused_channel(true);
+
+    // Setup the data channel
+    dma_channel_config c2 = dma_channel_get_default_config(data_chan);  // Default configs
+    channel_config_set_transfer_data_size(&c2, DMA_SIZE_16);            // 16-bit txfers
+    channel_config_set_read_increment(&c2, true);                       // yes read incrementing
+    channel_config_set_write_increment(&c2, false);                     // no write incrementing
+    // (X/Y)*sys_clk, where X is the first 16 bytes and Y is the second
+    // sys_clk is 125 MHz unless changed in code. Configured to ~44 kHz
+    dma_timer_set_fraction(0, 0x0017, 0xffff) ;
+    // 0x3b means timer0 (see SDK manual)
+    channel_config_set_dreq(&c2, 0x3b);                                 // DREQ paced by timer 0
+
+    dma_channel_configure(
+        data_chan,                  // Channel to be configured
+        &c2,                        // The configuration we just created
+        &spi_get_hw(SPI_PORT)->dr,  // write address (SPI data register)
+        DAC_data,                   // The initial read address
+        THUNK_SIZE,                 // Number of transfers
+        false                       // Don't start immediately.
+    );
 
     // Starting Center of Screen
     int x_coord = GALTON_BOARD_START_X;
     int y_coord = GALTON_BOARD_START_Y;
-    int x_coord_inc = 14;
-    int y_coord_inc = 14;
+    int x_coord_inc = PEG_SEPARATION_X;
+    int y_coord_inc = PEG_SEPARATION_Y;
     int x_start_adj = x_coord_inc/2;
     int peg_idx = 0;
     int bottom_left_peg_x = 0;
@@ -420,13 +690,11 @@ int main(){
     int bottom_right_peg_y = 0;
     int top_peg_x = 0;
     int top_peg_y = 0;
+    int bin_idx = 1;
 
     for (int row=0; row<GALTON_BOARD_ROWS; row++) { // Rows in Galton Board
         x_coord = 320 - x_start_adj*row; // Move starting location of pegs (no movement initially)
         for (int peg=0; peg<row+1; peg++) { // Pegs per row in Galton Board (1 more than row number)
-            // drawCircle(x_coord, y_coord, PEG_RADIUS, WHITE);
-            // fillCircle(x_coord, y_coord, PEG_RADIUS, WHITE);
-
             if (row == 0 && peg == 0) {
                 top_peg_x = x_coord;
                 top_peg_y = y_coord;
@@ -442,6 +710,14 @@ int main(){
             peg_array[peg_idx].x = int2fix15(x_coord);
             peg_array[peg_idx].y = int2fix15(y_coord);
             peg_array[peg_idx].r = int2fix15(PEG_RADIUS);
+            peg_array[peg_idx].id = peg_idx;
+            // Last row
+            if (row==GALTON_BOARD_ROWS-1) {
+                bins_array[bin_idx].x_i = peg_array[peg_idx].x;
+                bins_array[bin_idx].x_f = peg_array[peg_idx].x + int2fix15(x_coord_inc);
+                bins_array[bin_idx].num_balls = 0;
+                bin_idx += 1;
+            }
             peg_idx += 1;
             if (row > 0) {
                 x_coord += x_coord_inc; // increment x-coordinate to separate pegs horizontally
@@ -449,87 +725,28 @@ int main(){
         }
         y_coord += y_coord_inc; // move next drawing location vertically
     }
-    last_peg = &peg_array[0];
+    // Set initial bin coordinates
+    bins_array[0].x_i = bins_array[1].x_i - int2fix15(x_coord_inc);
+    bins_array[0].x_f = bins_array[1].x_i;
+    bins_array[0].num_balls = 0;
 
-    // sleep_ms(5000);
-    // printf("top_peg(x, y): (%d, %d)\n", top_peg_x, top_peg_y);
-    // printf("bottom_left_peg(x, y): (%d, %d)\n", bottom_left_peg_x, bottom_left_peg_y);
-    // printf("bottom_right_peg(x, y): (%d, %d)\n", bottom_right_peg_x, bottom_right_peg_y);
+    // Set the y-coordinate for the bottom of the Galton Board
+    bottom = y_coord;
 
-    int top_x = GALTON_BOARD_START_X;
-    int top_y = GALTON_BOARD_START_Y - 20;
-    int bottom_left_x = bottom_left_peg_x - 10;
-    // int bottom_left_x = bottom_left_peg_x - x_coord_inc;
-    int bottom_left_y = bottom_left_peg_y;
-    // int bottom_left_y = bottom_left_peg_y + y_coord_inc;
-    int bottom_right_x = bottom_right_peg_x + 10;
-    int bottom_right_y = bottom_right_peg_y;
-    // m = (y2 - y1)/(x2 - x1)
-    int slope_left = (top_y - bottom_left_y)/(top_x - bottom_left_x);
-    m_left = slope_left;
-    int slope_right = (top_y - bottom_right_y)/(top_x - bottom_right_x);
-    m_right = slope_right;
-    // y = mx + b -> b = y - mx
-    int b_left = top_y - slope_left*top_x;
-    b_lft = b_left;
-    int b_right = top_y - slope_right*top_x;
-    b_rght = b_right;
+    left_diag_slope = (bottom - (DIAGONAL_START_Y)) / (fix2int15(bins_array[0].x_i) - DIAGONAL_START_X);
+    b_left = DIAGONAL_START_Y - left_diag_slope*DIAGONAL_START_X;
+    right_diag_slope = (bottom - (DIAGONAL_START_Y)) / (fix2int15(bins_array[NUM_BINS-1].x_f) - DIAGONAL_START_X);
+    b_right = DIAGONAL_START_Y - (right_diag_slope*DIAGONAL_START_X);
+    
+    // Draw horizontal line where the galton board
+    drawHLine(0, bottom, 640, WHITE);
 
-    bottom = bottom_left_peg_y;
-
-    // Draw Left Diagonal of Galton Board (starting from bottom left)
-    for (int y = bottom_left_y; y >= top_y; y--) {
-        for (int x = bottom_left_x; x <= top_x; x++) {
-            if (y-slope_left*x == b_left) {
-                drawPixel(x, y, WHITE);
-            } else if (y-slope_left*x < b_left) {
-                drawPixel(x, y, RED);
-            } else {
-                // drawPixel(x, y, GREEN);
-            }
-        }
-    }
-    // Draw Right Diagonal of Galton Board (starting from bottom right)
-    for (int y = bottom_right_peg_y; y >= top_y; y--) {
-        for (int x = bottom_right_x; x >= top_x; x--) {
-            if (y-slope_right*x == b_right) {
-                drawPixel(x, y, WHITE);
-            } else if (y-slope_right*x < b_right) {
-                drawPixel(x, y, RED);
-            } else {
-                // drawPixel(x, y, GREEN);
-            }
-        }
-    }
-
+    // Initialize balls to start from top of Galton Board
     for (int i=0; i<NUM_BALLS; i++) {
         spawn_ball(&ball_array[i]);
     }
 
-    num = (GALTON_BOARD_ROWS*(GALTON_BOARD_ROWS+1)/2) - 1;
-    start = (GALTON_BOARD_ROWS*(GALTON_BOARD_ROWS+1)/2 - GALTON_BOARD_ROWS);
-
-    // bins_array[bin].x_i = peg_array[start].x - int2fix15(10);
-    // bins_array[bin].x_f = peg_array[start].x;
-    // bins_array[bin+10].x_i = peg_array[54].x;
-    // bins_array[bin+10].x_f = peg_array[54].x + int2fix15(10);
-
-    for (int i=0; i < GALTON_BOARD_ROWS+1; i++) {
-        if (i==0) { //45
-            bins_array[i].x_i = peg_array[start+i].x - int2fix15(10);
-            bins_array[i].x_f = peg_array[start+i].x;   
-        } else if (i==10) { //54
-            bins_array[i].x_i = peg_array[start+i-1].x;
-            bins_array[i].x_f = peg_array[start+i-1].x  + int2fix15(10);
-        } else {
-            bins_array[i].x_i = peg_array[start+i-1].x;
-            bins_array[i].x_f = peg_array[start+i].x;
-        }
-        bins_array[i].num_balls = 0;
-    }
-    
-
-    sleep_ms(3000);
+    sleep_ms(1000);
 
     // start core 1 
     multicore_reset_core1();
